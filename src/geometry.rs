@@ -1,4 +1,4 @@
-//! Surfaces of revolution carrying the flow.
+//! Closed surfaces of revolution about the polar axis.
 //!
 //! Geometry reaches the solver through this trait alone. [`Mesh`] builds an
 //! icosahedral graph on the unit sphere, pushes every point through

@@ -43,7 +43,7 @@ Williamson case 2, the steady zonal geostrophic flow, after five days
 | 5 | 10242 | 200 | 1.675e-4 | 6.277e-4 | 1.82 | 1.8e-14 | -4.5e-10 |
 
 Case 5, zonal flow over an isolated mountain, fifteen days at level 5
-(`cargo run --release --example williamson5`): mass holds to 5e-15, total
+(`cargo run --release --example williamson5`): mass is conserved to 5e-15, total
 energy drifts by 1e-9 and potential enstrophy by 5e-4. Output goes to a Zarr v3
 store that `zarr-python` and `xarray` open directly.
 
