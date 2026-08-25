@@ -3,6 +3,8 @@
 pub mod dec;
 pub mod geometry;
 pub mod mesh;
+pub mod parallel;
+pub mod ragged;
 pub mod swe;
 pub mod transport;
 pub mod trisk;

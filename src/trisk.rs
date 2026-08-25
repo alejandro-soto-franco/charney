@@ -11,25 +11,24 @@
 use crate::mesh::Mesh;
 
 /// One edge's reconstruction stencil.
+///
+/// The edge index and its weight sit together, so the Coriolis loop walks one
+/// stream rather than two.
 pub struct Weights {
-    /// Flattened stencil edges, indexed by `offset`.
-    pub edges: Vec<u32>,
-    /// Weight per stencil entry.
-    pub w: Vec<f64>,
+    entries: Vec<(u32, f64)>,
     /// `offset[e]..offset[e + 1]` is edge `e`'s slice.
-    pub offset: Vec<u32>,
+    offset: Vec<u32>,
 }
 
 impl Weights {
     pub fn new(mesh: &Mesh) -> Weights {
-        let mut edges = Vec::new();
-        let mut w = Vec::new();
+        let mut entries: Vec<(u32, f64)> = Vec::new();
         let mut offset = Vec::with_capacity(mesh.n_edges() + 1);
         offset.push(0u32);
 
         for e in 0..mesh.n_edges() {
             for &c in mesh.cells_on_edge[e].iter() {
-                let ring = &mesh.edges_on_cell[c];
+                let ring = &mesh.edges_on_cell.row(c);
                 let m = ring.len();
                 let i0 = ring
                     .iter()
@@ -41,31 +40,34 @@ impl Weights {
                     let idx = (i0 + step) % m;
                     // Stepping from edge idx-1 to edge idx crosses the dual
                     // that sits between them, whose kite is at slot idx.
-                    r += mesh.kite_on_cell[c][idx] / mesh.area_cell[c];
+                    r += mesh.kite_on_cell.row(c)[idx] / mesh.area_cell[c];
                     let eoe = ring[idx];
                     let sign_o = mesh.n_sign(eoe, c);
-                    edges.push(eoe as u32);
-                    w.push((0.5 - r) * sign_e * sign_o * mesh.dv[eoe] / mesh.dc[e]);
+                    let w = (0.5 - r) * sign_e * sign_o * mesh.dv[eoe] / mesh.dc[e];
+                    entries.push((eoe as u32, w));
                 }
             }
-            offset.push(edges.len() as u32);
+            offset.push(entries.len() as u32);
         }
 
-        Weights { edges, w, offset }
+        Weights { entries, offset }
     }
 
-    pub fn stencil(&self, e: usize) -> (&[u32], &[f64]) {
-        let a = self.offset[e] as usize;
-        let b = self.offset[e + 1] as usize;
-        (&self.edges[a..b], &self.w[a..b])
+    /// Edge indices and weights making up one edge's stencil.
+    pub fn stencil(&self, e: usize) -> &[(u32, f64)] {
+        &self.entries[self.offset[e] as usize..self.offset[e + 1] as usize]
+    }
+
+    /// Every weight, for tests that ask about their distribution.
+    pub fn all_weights(&self) -> impl Iterator<Item = f64> {
+        self.entries.iter().map(|&(_, w)| w)
     }
 
     /// Tangential component at every edge, from the normal components.
     pub fn perpendicular(&self, u: &[f64], out: &mut [f64]) {
         for (e, o) in out.iter_mut().enumerate() {
-            let (es, ws) = self.stencil(e);
             let mut acc = 0.0;
-            for (&eoe, &wt) in es.iter().zip(ws) {
+            for &(eoe, wt) in self.stencil(e) {
                 acc += wt * u[eoe as usize];
             }
             *o = acc;
@@ -139,18 +141,17 @@ mod tests {
         let weights = Weights::new(&mesh);
         // Weights near the antipodal edge of a hexagon vanish, so compare
         // against the typical magnitude rather than each pair's own.
-        let typical: f64 = weights.w.iter().map(|x| x.abs()).sum::<f64>() / weights.w.len() as f64;
+        let count = weights.all_weights().count() as f64;
+        let typical: f64 = weights.all_weights().map(|w| w.abs()).sum::<f64>() / count;
         let mut worst: f64 = 0.0;
         for e in 0..mesh.n_edges() {
-            let (es, ws) = weights.stencil(e);
-            for (&eoe, &wt) in es.iter().zip(ws) {
+            for &(eoe, wt) in weights.stencil(e) {
                 let eoe = eoe as usize;
-                let (es2, ws2) = weights.stencil(eoe);
-                let back: f64 = es2
+                let back: f64 = weights
+                    .stencil(eoe)
                     .iter()
-                    .zip(ws2)
-                    .filter(|&(&x, _)| x as usize == e)
-                    .map(|(_, &v)| v)
+                    .filter(|&&(x, _)| x as usize == e)
+                    .map(|&(_, v)| v)
                     .sum();
                 let lhs = wt * mesh.dc[e] * mesh.dv[e];
                 let rhs = back * mesh.dc[eoe] * mesh.dv[eoe];

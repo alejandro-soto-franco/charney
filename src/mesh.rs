@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use crate::geometry::Surface;
+use crate::ragged::Ragged;
 use crate::vec3::Vec3;
 
 /// A geodesic mesh and every geometric quantity the solver reads.
@@ -45,13 +46,26 @@ pub struct Mesh {
     pub edges_on_dual: Vec<[usize; 3]>,
 
     /// Edges around each cell, counter-clockwise. Entry `k` separates
-    /// `duals_on_cell[k]` from `duals_on_cell[k + 1]`.
-    pub edges_on_cell: Vec<Vec<usize>>,
+    /// `duals_on_cell(c)[k]` from `duals_on_cell(c)[k + 1]`.
+    pub edges_on_cell: Ragged<usize>,
     /// Duals around each cell, counter-clockwise.
-    pub duals_on_cell: Vec<Vec<usize>>,
+    pub duals_on_cell: Ragged<usize>,
     /// Area of the intersection of a cell with each of its incident duals,
     /// indexed as `duals_on_cell`.
-    pub kite_on_cell: Vec<Vec<f64>>,
+    pub kite_on_cell: Ragged<f64>,
+    /// The same areas seen from the dual, indexed as `cells_on_dual`. Lets an
+    /// average onto the duals gather rather than scatter.
+    pub kite_on_dual: Vec<[f64; 3]>,
+    /// Where an edge sits in each of its two cells' rings, in the order
+    /// `cells_on_edge` gives. Saves a search in the upwind reconstruction.
+    pub slot_on_cell: Vec<[usize; 2]>,
+    /// `dv` of each of a cell's edges, signed `+` where the normal leaves the
+    /// cell, indexed as `edges_on_cell`. The divergence then reads one
+    /// contiguous stream where it would otherwise gather `dv` and a sign.
+    pub signed_dv_on_cell: Ragged<f64>,
+    /// `dc` of each of a dual's edges, signed `+` where the counter-clockwise
+    /// circuit runs along the normal, indexed as `edges_on_dual`.
+    pub signed_dc_on_dual: Vec<[f64; 3]>,
 
     /// Distance between the two cell centres an edge separates.
     pub dc: Vec<f64>,
@@ -104,7 +118,8 @@ impl Mesh {
     /// Bisected icosahedron at the given level, embedded in the surface.
     pub fn icosahedral<S: Surface + ?Sized>(level: u32, surface: &S) -> Mesh {
         let (unit, tris) = bisected_icosahedron(level);
-        Mesh::from_triangulation(&unit, &tris, surface, level)
+        let topology = Topology::of(&tris, &unit);
+        Mesh::from_topology(&topology, &unit, surface, level)
     }
 
     /// The same grid after Lloyd relaxation on the unit sphere, which drives
@@ -117,77 +132,36 @@ impl Mesh {
     /// afterwards, so a sphere and a spheroid share one grid and differ only
     /// in geometry. Sixty sweeps are enough; `trisk` has a test for what
     /// they buy.
+    ///
+    /// Moving a cell centre changes no incidence, so the topology is built
+    /// once and each sweep touches positions alone.
     pub fn scvt<S: Surface + ?Sized>(level: u32, iterations: u32, surface: &S) -> Mesh {
         let (mut unit, tris) = bisected_icosahedron(level);
-        let ball = crate::geometry::Sphere::new(1.0);
+        let topology = Topology::of(&tris, &unit);
+        let mut sweep = LloydSweep::new(&topology);
         for _ in 0..iterations {
-            let m = Mesh::from_triangulation(&unit, &tris, &ball, level);
-            for (c, u) in unit.iter_mut().enumerate() {
-                *u = m.voronoi_centroid(c).normalized();
-            }
+            sweep.run(&topology, &mut unit);
         }
-        Mesh::from_triangulation(&unit, &tris, surface, level)
+        Mesh::from_topology(&topology, &unit, surface, level)
     }
 
-    /// Area-weighted centroid of a Voronoi cell, in the ambient space.
-    fn voronoi_centroid(&self, c: usize) -> Vec3 {
-        let ring = &self.duals_on_cell[c];
-        let edges = &self.edges_on_cell[c];
-        let m = ring.len();
-        let x = self.cell_pos[c];
-        let mut acc = Vec3::ZERO;
-        let mut area = 0.0;
-        for k in 0..m {
-            let v = self.dual_pos[ring[k]];
-            let prev = self.edge_pos[edges[(k + m - 1) % m]];
-            let next = self.edge_pos[edges[k]];
-            for (a, b) in [(prev, v), (v, next)] {
-                let t = Vec3::triangle_area(x, a, b);
-                acc += (x + a + b) * (t / 3.0);
-                area += t;
-            }
-        }
-        acc / area
-    }
-
-    fn from_triangulation<S: Surface + ?Sized>(
+    fn from_topology<S: Surface + ?Sized>(
+        topology: &Topology,
         unit: &[Vec3],
-        tris: &[[usize; 3]],
         surface: &S,
         level: u32,
     ) -> Mesh {
         let n_cells = unit.len();
-        let n_duals = tris.len();
+        let n_duals = topology.tris.len();
+        let n_edges = topology.cells_on_edge.len();
 
         let cell_pos: Vec<Vec3> = unit.iter().map(|&u| surface.embed(u)).collect();
-
-        let dual_pos: Vec<Vec3> = tris
+        let dual_pos: Vec<Vec3> = topology
+            .tris
             .iter()
             .map(|t| Vec3::circumcenter(cell_pos[t[0]], cell_pos[t[1]], cell_pos[t[2]]))
             .collect();
         let dual_site: Vec<Vec3> = dual_pos.iter().map(|&c| surface.project(c)).collect();
-
-        // Edges, keyed by the sorted pair of cells.
-        let mut key_to_edge: HashMap<(usize, usize), usize> = HashMap::new();
-        let mut cells_on_edge: Vec<[usize; 2]> = Vec::new();
-        let mut duals_of_edge: Vec<Vec<usize>> = Vec::new();
-        for (t_idx, t) in tris.iter().enumerate() {
-            for k in 0..3 {
-                let (a, b) = (t[k], t[(k + 1) % 3]);
-                let key = if a < b { (a, b) } else { (b, a) };
-                let e = *key_to_edge.entry(key).or_insert_with(|| {
-                    cells_on_edge.push([key.0, key.1]);
-                    duals_of_edge.push(Vec::with_capacity(2));
-                    cells_on_edge.len() - 1
-                });
-                duals_of_edge[e].push(t_idx);
-            }
-        }
-        let n_edges = cells_on_edge.len();
-        assert!(
-            duals_of_edge.iter().all(|d| d.len() == 2),
-            "every edge of a closed surface meets exactly two triangles"
-        );
 
         // Per-edge frame. The normal runs from the first cell to the second,
         // projected into the tangent plane at the edge midpoint.
@@ -201,14 +175,14 @@ impl Mesh {
         let mut duals_on_edge = Vec::with_capacity(n_edges);
 
         for e in 0..n_edges {
-            let [c0, c1] = cells_on_edge[e];
+            let [c0, c1] = topology.cells_on_edge[e];
             let mid = (cell_pos[c0] + cell_pos[c1]) / 2.0;
             let site = surface.project(mid);
             let up = surface.normal(site);
             let n = (cell_pos[c1] - cell_pos[c0]).tangent_to(up).normalized();
             let t = up.cross(n);
 
-            let (v0, v1) = (duals_of_edge[e][0], duals_of_edge[e][1]);
+            let [v0, v1] = topology.duals_on_edge[e];
             let (v0, v1) = if (dual_pos[v1] - dual_pos[v0]).dot(t) >= 0.0 {
                 (v0, v1)
             } else {
@@ -225,64 +199,33 @@ impl Mesh {
             edge_tangent.push(t);
         }
 
-        // Incidence: which duals and edges touch each cell.
-        let mut duals_at_cell: Vec<Vec<usize>> = vec![Vec::new(); n_cells];
-        for (t_idx, t) in tris.iter().enumerate() {
-            for &c in t.iter() {
-                duals_at_cell[c].push(t_idx);
-            }
-        }
-
         let cell_up: Vec<Vec3> = cell_pos.iter().map(|&p| surface.normal(p)).collect();
         let dual_up: Vec<Vec3> = dual_site.iter().map(|&p| surface.normal(p)).collect();
 
-        // Order the ring of duals around each cell counter-clockwise as seen
-        // from outside, then read off the interleaved edges.
-        let mut duals_on_cell: Vec<Vec<usize>> = Vec::with_capacity(n_cells);
-        let mut edges_on_cell: Vec<Vec<usize>> = Vec::with_capacity(n_cells);
-        for c in 0..n_cells {
-            let ring = order_ring(c, &duals_at_cell[c], tris, &cell_pos, &dual_pos, cell_up[c]);
-            let m = ring.len();
-            let mut edges = Vec::with_capacity(m);
-            for k in 0..m {
-                let (a, b) = (ring[k], ring[(k + 1) % m]);
-                // The shared edge of two adjacent triangles, incident to c.
-                let other = shared_other_vertex(tris[a], tris[b], c);
-                let key = if c < other { (c, other) } else { (other, c) };
-                edges.push(key_to_edge[&key]);
-            }
-            duals_on_cell.push(ring);
-            edges_on_cell.push(edges);
-        }
-
-        // Kite areas: the quadrilateral cut from a cell by one of its duals,
-        // bounded by the cell centre, two edge midpoints, and the dual.
-        let mut kite_on_cell: Vec<Vec<f64>> = Vec::with_capacity(n_cells);
+        let mut kite_on_cell =
+            Ragged::filled((0..n_cells).map(|c| topology.duals_on_cell.row_len(c)), 0.0);
         let mut area_cell = vec![0.0; n_cells];
         let mut area_dual = vec![0.0; n_duals];
+        kites(
+            topology,
+            &cell_pos,
+            &dual_pos,
+            &edge_pos,
+            &mut kite_on_cell,
+            &mut area_cell,
+        );
         for c in 0..n_cells {
-            let m = duals_on_cell[c].len();
-            let mut kites = Vec::with_capacity(m);
-            for k in 0..m {
-                let v = duals_on_cell[c][k];
-                let e_prev = edges_on_cell[c][(k + m - 1) % m];
-                let e_next = edges_on_cell[c][k];
-                let x = cell_pos[c];
-                let a = Vec3::triangle_area(x, edge_pos[e_prev], dual_pos[v]);
-                let b = Vec3::triangle_area(x, dual_pos[v], edge_pos[e_next]);
-                let kite = a + b;
-                kites.push(kite);
-                area_cell[c] += kite;
-                area_dual[v] += kite;
+            for (k, &v) in topology.duals_on_cell.row(c).iter().enumerate() {
+                area_dual[v] += kite_on_cell.row(c)[k];
             }
-            kite_on_cell.push(kites);
         }
 
         // Dual incidence, counter-clockwise, consistent with the primal
         // triangle winding.
+        let mut kite_on_dual = vec![[0.0f64; 3]; n_duals];
         let mut cells_on_dual = Vec::with_capacity(n_duals);
         let mut edges_on_dual = Vec::with_capacity(n_duals);
-        for (t_idx, t) in tris.iter().enumerate() {
+        for (t_idx, t) in topology.tris.iter().enumerate() {
             let mut ccw = *t;
             let n = (cell_pos[t[1]] - cell_pos[t[0]]).cross(cell_pos[t[2]] - cell_pos[t[0]]);
             if n.dot(dual_up[t_idx]) < 0.0 {
@@ -290,28 +233,37 @@ impl Mesh {
             }
             let mut es = [0usize; 3];
             for k in 0..3 {
-                let (a, b) = (ccw[k], ccw[(k + 1) % 3]);
-                let key = if a < b { (a, b) } else { (b, a) };
-                es[k] = key_to_edge[&key];
+                es[k] = topology.edge_between(ccw[k], ccw[(k + 1) % 3]);
+            }
+            for (k, &c) in ccw.iter().enumerate() {
+                let slot = topology
+                    .duals_on_cell
+                    .row(c)
+                    .iter()
+                    .position(|&v| v == t_idx)
+                    .expect("a triangle rings each of its own cells");
+                kite_on_dual[t_idx][k] = kite_on_cell.row(c)[slot];
             }
             cells_on_dual.push(ccw);
             edges_on_dual.push(es);
         }
 
-        Mesh {
+        let mut mesh = Mesh {
             level,
             cell_pos,
             dual_pos,
             edge_pos,
             dual_site,
             edge_site,
-            cells_on_edge,
+            cells_on_edge: topology.cells_on_edge.clone(),
             duals_on_edge,
             cells_on_dual,
             edges_on_dual,
-            edges_on_cell,
-            duals_on_cell,
+            edges_on_cell: topology.edges_on_cell.clone(),
+            duals_on_cell: topology.duals_on_cell.clone(),
             kite_on_cell,
+            kite_on_dual,
+            slot_on_cell: topology.slot_on_cell.clone(),
             dc,
             dv,
             edge_normal,
@@ -321,7 +273,245 @@ impl Mesh {
             cell_up,
             dual_up,
             edge_up,
+            signed_dv_on_cell: Ragged::from_rows(&[]),
+            signed_dc_on_dual: Vec::new(),
+        };
+        mesh.index_signed_metrics();
+        mesh
+    }
+
+    /// Fold each orientation sign into the length it multiplies.
+    fn index_signed_metrics(&mut self) {
+        let rows: Vec<Vec<f64>> = (0..self.n_cells())
+            .map(|c| {
+                self.edges_on_cell
+                    .row(c)
+                    .iter()
+                    .map(|&e| self.n_sign(e, c) * self.dv[e])
+                    .collect()
+            })
+            .collect();
+        self.signed_dv_on_cell = Ragged::from_rows(&rows);
+
+        self.signed_dc_on_dual = (0..self.n_duals())
+            .map(|v| {
+                let ring = self.cells_on_dual[v];
+                let mut s = [0.0; 3];
+                for k in 0..3 {
+                    let e = self.edges_on_dual[v][k];
+                    let sign = if self.cells_on_edge[e][0] == ring[k] {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    s[k] = sign * self.dc[e];
+                }
+                s
+            })
+            .collect();
+    }
+}
+
+/// Incidence that survives a cell centre moving: which cells an edge
+/// separates, which edges and duals ring a cell, and which duals an edge
+/// joins. Built once and shared by every Lloyd sweep.
+struct Topology {
+    tris: Vec<[usize; 3]>,
+    cells_on_edge: Vec<[usize; 2]>,
+    duals_on_edge: Vec<[usize; 2]>,
+    edges_on_cell: Ragged<usize>,
+    duals_on_cell: Ragged<usize>,
+    slot_on_cell: Vec<[usize; 2]>,
+    /// Edge index by sorted cell pair.
+    key_to_edge: HashMap<(usize, usize), usize>,
+}
+
+impl Topology {
+    fn of(tris: &[[usize; 3]], unit: &[Vec3]) -> Topology {
+        let n_cells = unit.len();
+        let mut key_to_edge: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut cells_on_edge: Vec<[usize; 2]> = Vec::new();
+        let mut duals_of_edge: Vec<Vec<usize>> = Vec::new();
+        for (t_idx, t) in tris.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                let key = if a < b { (a, b) } else { (b, a) };
+                let e = *key_to_edge.entry(key).or_insert_with(|| {
+                    cells_on_edge.push([key.0, key.1]);
+                    duals_of_edge.push(Vec::with_capacity(2));
+                    cells_on_edge.len() - 1
+                });
+                duals_of_edge[e].push(t_idx);
+            }
         }
+        assert!(
+            duals_of_edge.iter().all(|d| d.len() == 2),
+            "every edge of a closed surface meets exactly two triangles"
+        );
+        let duals_on_edge: Vec<[usize; 2]> = duals_of_edge.iter().map(|d| [d[0], d[1]]).collect();
+
+        // Which triangles touch each cell.
+        let mut duals_at_cell: Vec<Vec<usize>> = vec![Vec::new(); n_cells];
+        for (t_idx, t) in tris.iter().enumerate() {
+            for &c in t.iter() {
+                duals_at_cell[c].push(t_idx);
+            }
+        }
+
+        // The ring of duals around a cell, in cycle order. Which way round it
+        // runs still depends on geometry, so the sense is fixed later, once
+        // per build, by `orient_rings`.
+        let mut duals_rows: Vec<Vec<usize>> = Vec::with_capacity(n_cells);
+        let mut edges_rows: Vec<Vec<usize>> = Vec::with_capacity(n_cells);
+        for (c, incident) in duals_at_cell.iter().enumerate() {
+            let ring = cycle(c, incident, tris);
+            let m = ring.len();
+            let mut edges = Vec::with_capacity(m);
+            for k in 0..m {
+                let other = shared_other_vertex(tris[ring[k]], tris[ring[(k + 1) % m]], c);
+                let key = if c < other { (c, other) } else { (other, c) };
+                edges.push(key_to_edge[&key]);
+            }
+            duals_rows.push(ring);
+            edges_rows.push(edges);
+        }
+
+        let mut topology = Topology {
+            tris: tris.to_vec(),
+            cells_on_edge,
+            duals_on_edge,
+            edges_on_cell: Ragged::from_rows(&edges_rows),
+            duals_on_cell: Ragged::from_rows(&duals_rows),
+            slot_on_cell: Vec::new(),
+            key_to_edge,
+        };
+        topology.orient_rings(unit);
+        topology.index_slots();
+        topology
+    }
+
+    /// Where each edge sits in the rings of the two cells it separates.
+    fn index_slots(&mut self) {
+        self.slot_on_cell = (0..self.cells_on_edge.len())
+            .map(|e| {
+                let [c0, c1] = self.cells_on_edge[e];
+                let find = |cell: usize| {
+                    self.edges_on_cell
+                        .row(cell)
+                        .iter()
+                        .position(|&x| x == e)
+                        .expect("an edge lies in the ring of each cell it separates")
+                };
+                [find(c0), find(c1)]
+            })
+            .collect();
+    }
+
+    fn edge_between(&self, a: usize, b: usize) -> usize {
+        let key = if a < b { (a, b) } else { (b, a) };
+        self.key_to_edge[&key]
+    }
+
+    /// Turn every cell's ring counter-clockwise as seen from outside, for the
+    /// given positions. Cheap, and the sense can only flip if a cell centre
+    /// crosses its own ring, which relaxation never does.
+    fn orient_rings(&mut self, pos: &[Vec3]) {
+        for c in 0..pos.len() {
+            let ring = self.duals_on_cell.row(c);
+            let a = circumcenter_of(&self.tris[ring[0]], pos) - pos[c];
+            let b = circumcenter_of(&self.tris[ring[1]], pos) - pos[c];
+            if a.cross(b).dot(pos[c].normalized()) < 0.0 {
+                self.duals_on_cell.row_mut(c)[1..].reverse();
+                let m = self.edges_on_cell.row_len(c);
+                let ring: Vec<usize> = self.duals_on_cell.row(c).to_vec();
+                let edges = self.edges_on_cell.row_mut(c);
+                for k in 0..m {
+                    let other =
+                        shared_other_vertex(self.tris[ring[k]], self.tris[ring[(k + 1) % m]], c);
+                    let key = if c < other { (c, other) } else { (other, c) };
+                    edges[k] = self.key_to_edge[&key];
+                }
+            }
+        }
+    }
+}
+
+fn circumcenter_of(t: &[usize; 3], pos: &[Vec3]) -> Vec3 {
+    Vec3::circumcenter(pos[t[0]], pos[t[1]], pos[t[2]])
+}
+
+/// Kite areas and the cell areas they sum to, from a set of positions.
+fn kites(
+    topology: &Topology,
+    cell_pos: &[Vec3],
+    dual_pos: &[Vec3],
+    edge_pos: &[Vec3],
+    kite: &mut Ragged<f64>,
+    area_cell: &mut [f64],
+) {
+    for c in 0..cell_pos.len() {
+        let ring = topology.duals_on_cell.row(c);
+        let edges = topology.edges_on_cell.row(c);
+        let m = ring.len();
+        let x = cell_pos[c];
+        let mut total = 0.0;
+        for k in 0..m {
+            let v = dual_pos[ring[k]];
+            let prev = edge_pos[edges[(k + m - 1) % m]];
+            let next = edge_pos[edges[k]];
+            let a = Vec3::triangle_area(x, prev, v) + Vec3::triangle_area(x, v, next);
+            kite.row_mut(c)[k] = a;
+            total += a;
+        }
+        area_cell[c] = total;
+    }
+}
+
+/// One Lloyd sweep: move every cell centre to the centroid of its own
+/// Voronoi cell on the unit sphere. Buffers are reused across sweeps.
+struct LloydSweep {
+    dual_pos: Vec<Vec3>,
+    edge_pos: Vec<Vec3>,
+    centroid: Vec<Vec3>,
+}
+
+impl LloydSweep {
+    fn new(topology: &Topology) -> LloydSweep {
+        LloydSweep {
+            dual_pos: vec![Vec3::ZERO; topology.tris.len()],
+            edge_pos: vec![Vec3::ZERO; topology.cells_on_edge.len()],
+            centroid: vec![Vec3::ZERO; topology.duals_on_cell.rows()],
+        }
+    }
+
+    fn run(&mut self, topology: &Topology, unit: &mut [Vec3]) {
+        for (v, t) in self.dual_pos.iter_mut().zip(&topology.tris) {
+            *v = circumcenter_of(t, unit);
+        }
+        for (e, &[c0, c1]) in self.edge_pos.iter_mut().zip(&topology.cells_on_edge) {
+            *e = (unit[c0] + unit[c1]) / 2.0;
+        }
+
+        for (c, out) in self.centroid.iter_mut().enumerate() {
+            let ring = topology.duals_on_cell.row(c);
+            let edges = topology.edges_on_cell.row(c);
+            let m = ring.len();
+            let x = unit[c];
+            let mut acc = Vec3::ZERO;
+            let mut area = 0.0;
+            for k in 0..m {
+                let v = self.dual_pos[ring[k]];
+                let prev = self.edge_pos[edges[(k + m - 1) % m]];
+                let next = self.edge_pos[edges[k]];
+                for (a, b) in [(prev, v), (v, next)] {
+                    let t = Vec3::triangle_area(x, a, b);
+                    acc += (x + a + b) * (t / 3.0);
+                    area += t;
+                }
+            }
+            *out = (acc / area).normalized();
+        }
+        unit.copy_from_slice(&self.centroid);
     }
 }
 
@@ -335,16 +525,9 @@ fn shared_other_vertex(a: [usize; 3], b: [usize; 3], c: usize) -> usize {
     unreachable!("adjacent triangles around a cell share a second vertex")
 }
 
-/// Walk the incident triangles of a cell into a counter-clockwise ring.
-fn order_ring(
-    c: usize,
-    incident: &[usize],
-    tris: &[[usize; 3]],
-    cell_pos: &[Vec3],
-    dual_pos: &[Vec3],
-    up: Vec3,
-) -> Vec<usize> {
-    // Two incident triangles are adjacent when they share an edge through c.
+/// Walk the incident triangles of a cell into a cycle. Which way round it
+/// runs is settled afterwards by `Topology::orient_rings`.
+fn cycle(c: usize, incident: &[usize], tris: &[[usize; 3]]) -> Vec<usize> {
     let adjacent = |a: usize, b: usize| -> bool {
         let ta = tris[a];
         let tb = tris[b];
@@ -366,14 +549,6 @@ fn order_ring(
             }
         }
         assert!(advanced, "the triangles around a cell form one cycle");
-    }
-
-    // Fix the sense of circulation.
-    let x = cell_pos[c];
-    let a = dual_pos[ring[0]] - x;
-    let b = dual_pos[ring[1]] - x;
-    if a.cross(b).dot(up) < 0.0 {
-        ring[1..].reverse();
     }
     ring
 }
@@ -555,8 +730,8 @@ mod tests {
     fn every_cell_ring_closes_on_its_edges() {
         let m = Mesh::icosahedral(2, &Sphere::new(1.0));
         for c in 0..m.n_cells() {
-            let ring = &m.duals_on_cell[c];
-            let edges = &m.edges_on_cell[c];
+            let ring = &m.duals_on_cell.row(c);
+            let edges = &m.edges_on_cell.row(c);
             assert_eq!(ring.len(), edges.len());
             for k in 0..ring.len() {
                 let e = edges[k];

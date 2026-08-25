@@ -11,6 +11,11 @@ keywords     = ["shallow-water", "geophysical", "climate", "sphere", "zarr"]
 categories   = ["science", "simulation", "mathematics"]
 
 [dependencies]
+rayon = { version = "1.11", optional = true }
+
+[features]
+default  = []
+parallel = ["dep:rayon"]
 
 [profile.release]
 lto           = "thin"

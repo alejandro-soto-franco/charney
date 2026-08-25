@@ -15,9 +15,10 @@
 //! divergence of edge fluxes, which telescopes, so their totals are conserved
 //! to rounding.
 
-use crate::dec::{self, Signs};
+use crate::dec;
 use crate::geometry::Surface;
 use crate::mesh::Mesh;
+use crate::parallel;
 use crate::transport::{Gradients, TracerFlux};
 use crate::trisk::Weights;
 use crate::vec3::Vec3;
@@ -92,7 +93,6 @@ pub struct Invariants {
 /// Mesh, constants and scratch space for one configuration.
 pub struct Model {
     pub mesh: Mesh,
-    pub signs: Signs,
     pub weights: Weights,
     /// Gravity.
     pub g: f64,
@@ -113,12 +113,14 @@ pub struct Model {
     /// How the mixing ratio reaches an edge for the tracer flux.
     pub tracer_flux_scheme: TracerFlux,
 
-    h_edge: Vec<f64>,
     flux: Vec<f64>,
     zeta: Vec<f64>,
     h_dual: Vec<f64>,
     q_dual: Vec<f64>,
-    q_edge: Vec<f64>,
+    /// Potential vorticity and mass flux at each edge, side by side. The
+    /// Coriolis loop gathers both for every stencil neighbour, so one stream
+    /// halves the cache lines it touches.
+    pv_flux: Vec<[f64; 2]>,
     kinetic: Vec<f64>,
     phi: Vec<f64>,
     grad: Vec<f64>,
@@ -139,7 +141,6 @@ pub const GRAVITY: f64 = 9.806_16;
 
 impl Model {
     pub fn new<S: Surface + ?Sized>(mesh: Mesh, surface: &S, g: f64, omega: f64) -> Model {
-        let signs = Signs::new(&mesh);
         let weights = Weights::new(&mesh);
         let gradients = Gradients::new(&mesh);
         let f_dual = (0..mesh.n_duals())
@@ -148,7 +149,6 @@ impl Model {
         let (nc, ne, nv) = (mesh.n_cells(), mesh.n_edges(), mesh.n_duals());
         Model {
             mesh,
-            signs,
             weights,
             g,
             f_dual,
@@ -156,12 +156,11 @@ impl Model {
             nu4: 0.0,
             frozen_flow: false,
             tracer_flux_scheme: TracerFlux::default(),
-            h_edge: vec![0.0; ne],
             flux: vec![0.0; ne],
             zeta: vec![0.0; nv],
             h_dual: vec![0.0; nv],
             q_dual: vec![0.0; nv],
-            q_edge: vec![0.0; ne],
+            pv_flux: vec![[0.0; 2]; ne],
             kinetic: vec![0.0; nc],
             phi: vec![0.0; nc],
             grad: vec![0.0; ne],
@@ -222,41 +221,61 @@ impl Model {
 
     fn diagnose(&mut self, s: &State) {
         let m = &self.mesh;
-        for e in 0..m.n_edges() {
-            let [c0, c1] = m.cells_on_edge[e];
-            self.h_edge[e] = 0.5 * (s.h[c0] + s.h[c1]);
-            self.flux[e] = self.h_edge[e] * s.u[e];
-        }
-        dec::curl(m, &self.signs, &s.u, &mut self.zeta);
-        dec::cell_to_dual(m, &s.h, &mut self.h_dual);
-        for v in 0..m.n_duals() {
-            self.q_dual[v] = (self.zeta[v] + self.f_dual[v]) / self.h_dual[v];
-        }
-        for e in 0..m.n_edges() {
-            let [v0, v1] = m.duals_on_edge[e];
-            self.q_edge[e] = 0.5 * (self.q_dual[v0] + self.q_dual[v1]);
-        }
-        for c in 0..m.n_cells() {
-            let mut acc = 0.0;
-            for &e in &m.edges_on_cell[c] {
-                acc += m.dc[e] * m.dv[e] * s.u[e] * s.u[e];
+        parallel::chunks(&mut self.flux, |start, part| {
+            for (i, f) in part.iter_mut().enumerate() {
+                let e = start + i;
+                let [c0, c1] = m.cells_on_edge[e];
+                *f = 0.5 * (s.h[c0] + s.h[c1]) * s.u[e];
             }
-            self.kinetic[c] = 0.25 * acc / m.area_cell[c];
-            self.phi[c] = self.g * (s.h[c] + self.bottom[c]) + self.kinetic[c];
-        }
+        });
+        dec::curl(m, &s.u, &mut self.zeta);
+        dec::cell_to_dual(m, &s.h, &mut self.h_dual);
+
+        let (zeta, h_dual, f_dual) = (&self.zeta, &self.h_dual, &self.f_dual);
+        parallel::chunks(&mut self.q_dual, |start, part| {
+            for (i, q) in part.iter_mut().enumerate() {
+                let v = start + i;
+                *q = (zeta[v] + f_dual[v]) / h_dual[v];
+            }
+        });
+
+        let (q_dual, flux) = (&self.q_dual, &self.flux);
+        parallel::chunks(&mut self.pv_flux, |start, part| {
+            for (i, slot) in part.iter_mut().enumerate() {
+                let e = start + i;
+                let [v0, v1] = m.duals_on_edge[e];
+                *slot = [0.5 * (q_dual[v0] + q_dual[v1]), flux[e]];
+            }
+        });
+
+        let (g, bottom) = (self.g, &self.bottom);
+        parallel::zip_chunks(&mut self.kinetic, &mut self.phi, |start, kin, phi| {
+            for (i, (k, p)) in kin.iter_mut().zip(phi.iter_mut()).enumerate() {
+                let c = start + i;
+                let mut acc = 0.0;
+                for &e in m.edges_on_cell.row(c) {
+                    acc += m.dc[e] * m.dv[e] * s.u[e] * s.u[e];
+                }
+                *k = 0.25 * acc / m.area_cell[c];
+                *p = g * (s.h[c] + bottom[c]) + *k;
+            }
+        });
     }
 
     /// Vector Laplacian of an edge field, as `grad div - curl curl`.
     fn vector_laplacian(&mut self, u: &[f64], out: &mut [f64]) {
         let m = &self.mesh;
-        dec::divergence(m, &self.signs, u, &mut self.div_u);
-        dec::curl(m, &self.signs, u, &mut self.zeta);
-        for (e, o) in out.iter_mut().enumerate() {
-            let [c0, c1] = m.cells_on_edge[e];
-            let [v0, v1] = m.duals_on_edge[e];
-            *o = (self.div_u[c1] - self.div_u[c0]) / m.dc[e]
-                - (self.zeta[v1] - self.zeta[v0]) / m.dv[e];
-        }
+        dec::divergence(m, u, &mut self.div_u);
+        dec::curl(m, u, &mut self.zeta);
+        let (div_u, zeta) = (&self.div_u, &self.zeta);
+        parallel::chunks(out, |start, part| {
+            for (i, o) in part.iter_mut().enumerate() {
+                let e = start + i;
+                let [c0, c1] = m.cells_on_edge[e];
+                let [v0, v1] = m.duals_on_edge[e];
+                *o = (div_u[c1] - div_u[c0]) / m.dc[e] - (zeta[v1] - zeta[v0]) / m.dv[e];
+            }
+        });
     }
 
     /// Right-hand side of the system at `s`.
@@ -273,28 +292,35 @@ impl Model {
     }
 
     fn flow_tendency(&mut self, s: &State, out: &mut State) {
-        dec::divergence(&self.mesh, &self.signs, &self.flux, &mut out.h);
+        dec::divergence(&self.mesh, &self.flux, &mut out.h);
         out.h.iter_mut().for_each(|x| *x = -*x);
 
         dec::gradient(&self.mesh, &self.phi, &mut self.grad);
-        for e in 0..self.mesh.n_edges() {
-            let (es, ws) = self.weights.stencil(e);
-            let mut coriolis = 0.0;
-            for (&eoe, &wt) in es.iter().zip(ws) {
-                let eoe = eoe as usize;
-                coriolis += wt * 0.5 * (self.q_edge[e] + self.q_edge[eoe]) * self.flux[eoe];
+        let (weights, pv_flux, grad) = (&self.weights, &self.pv_flux, &self.grad);
+        parallel::chunks(&mut out.u, |start, part| {
+            for (i, o) in part.iter_mut().enumerate() {
+                let e = start + i;
+                let here = pv_flux[e][0];
+                let mut coriolis = 0.0;
+                for &(eoe, wt) in weights.stencil(e) {
+                    let [q, f] = pv_flux[eoe as usize];
+                    coriolis += wt * (here + q) * f;
+                }
+                *o = 0.5 * coriolis - grad[e];
             }
-            out.u[e] = coriolis - self.grad[e];
-        }
+        });
 
         if self.nu4 != 0.0 {
             let mut lap = std::mem::take(&mut self.lap_u);
             let mut lap2 = std::mem::take(&mut self.lap2_u);
             self.vector_laplacian(&s.u, &mut lap);
             self.vector_laplacian(&lap, &mut lap2);
-            for (o, &d) in out.u.iter_mut().zip(lap2.iter()) {
-                *o -= self.nu4 * d;
-            }
+            let nu4 = self.nu4;
+            parallel::chunks(&mut out.u, |start, part| {
+                for (i, o) in part.iter_mut().enumerate() {
+                    *o -= nu4 * lap2[start + i];
+                }
+            });
             self.lap_u = lap;
             self.lap2_u = lap2;
         }
@@ -304,13 +330,12 @@ impl Model {
         for k in 0..s.n_tracers() {
             // Interpolating the mixing ratio, rather than the column mass,
             // is what keeps a uniform tracer uniform under a divergent flow.
-            for (q, (&hq, &h)) in self
-                .mixing
-                .iter_mut()
-                .zip(s.tracer_mass[k].iter().zip(&s.h))
-            {
-                *q = hq / h;
-            }
+            let (hq_all, h_all) = (&s.tracer_mass[k], &s.h);
+            parallel::chunks(&mut self.mixing, |start, part| {
+                for (i, q) in part.iter_mut().enumerate() {
+                    *q = hq_all[start + i] / h_all[start + i];
+                }
+            });
             if self.tracer_flux_scheme != TracerFlux::Centered {
                 self.gradients
                     .compute(&self.mesh, &self.mixing, &mut self.tracer_gradient);
@@ -321,29 +346,38 @@ impl Model {
             }
 
             let m = &self.mesh;
-            for e in 0..m.n_edges() {
-                let [c0, c1] = m.cells_on_edge[e];
-                let q_edge = match self.tracer_flux_scheme {
-                    TracerFlux::Centered => 0.5 * (self.mixing[c0] + self.mixing[c1]),
-                    _ => {
-                        // A positive normal velocity runs from the first cell
-                        // to the second, so the first cell is upwind.
-                        let from = if self.flux[e] >= 0.0 { c0 } else { c1 };
-                        let slot = Gradients::slot_of(m, from, e);
-                        self.gradients.at_edge(
-                            from,
-                            slot,
-                            self.mixing[from],
-                            self.tracer_gradient[from],
-                        )
-                    }
-                };
-                self.tracer_flux[e] = self.flux[e] * q_edge;
-            }
-            dec::divergence(m, &self.signs, &self.tracer_flux, &mut self.scratch_cell);
-            for (o, &d) in out.tracer_mass[k].iter_mut().zip(self.scratch_cell.iter()) {
-                *o = -d;
-            }
+            let (scheme, mixing, grads, gradient, flux) = (
+                self.tracer_flux_scheme,
+                &self.mixing,
+                &self.gradients,
+                &self.tracer_gradient,
+                &self.flux,
+            );
+            parallel::chunks(&mut self.tracer_flux, |start, part| {
+                for (i, o) in part.iter_mut().enumerate() {
+                    let e = start + i;
+                    let [c0, c1] = m.cells_on_edge[e];
+                    let q_edge = match scheme {
+                        TracerFlux::Centered => 0.5 * (mixing[c0] + mixing[c1]),
+                        _ => {
+                            // A positive normal velocity runs from the first
+                            // cell to the second, so the first cell is upwind.
+                            let from_first = flux[e] >= 0.0;
+                            let from = if from_first { c0 } else { c1 };
+                            let slot = m.slot_on_cell[e][usize::from(!from_first)];
+                            grads.at_edge(from, slot, mixing[from], gradient[from])
+                        }
+                    };
+                    *o = flux[e] * q_edge;
+                }
+            });
+            dec::divergence(&self.mesh, &self.tracer_flux, &mut self.scratch_cell);
+            let scratch = &self.scratch_cell;
+            parallel::chunks(&mut out.tracer_mass[k], |start, part| {
+                for (i, o) in part.iter_mut().enumerate() {
+                    *o = -scratch[start + i];
+                }
+            });
         }
     }
 
@@ -422,7 +456,7 @@ impl Model {
         }
     }
 
-    /// Velocity at each cell centre by the Perot reconstruction.
+    /// Velocity at each cell centre by the Perot reconstruction (Perot 2000).
     ///
     /// On an orthogonal mesh the arm from the cell centre to an edge midpoint
     /// runs along that edge's outward normal, so the two orientation signs in
@@ -431,7 +465,7 @@ impl Model {
         let m = &self.mesh;
         for (c, o) in out.iter_mut().enumerate() {
             let mut v = Vec3::ZERO;
-            for &e in &m.edges_on_cell[c] {
+            for &e in m.edges_on_cell.row(c) {
                 let arm = (m.edge_pos[e] - m.cell_pos[c]).norm();
                 v += m.edge_normal[e] * (m.dv[e] * arm * s.u[e]);
             }

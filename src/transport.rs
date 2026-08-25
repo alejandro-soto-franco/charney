@@ -48,7 +48,7 @@ impl Gradients {
 
         for c in 0..mesh.n_cells() {
             let up = mesh.cell_up[c];
-            let e1 = mesh.edge_normal[mesh.edges_on_cell[c][0]]
+            let e1 = mesh.edge_normal[mesh.edges_on_cell.row(c)[0]]
                 .tangent_to(up)
                 .normalized();
             let e2 = up.cross(e1);
@@ -56,8 +56,9 @@ impl Gradients {
             // Normal equations for the plane fit, weighted by inverse
             // distance so the nearer neighbours count for more.
             let (mut m11, mut m12, mut m22) = (0.0, 0.0, 0.0);
-            let mut rows: Vec<(f64, f64, f64)> = Vec::with_capacity(mesh.edges_on_cell[c].len());
-            for &e in &mesh.edges_on_cell[c] {
+            let mut rows: Vec<(f64, f64, f64)> =
+                Vec::with_capacity(mesh.edges_on_cell.row(c).len());
+            for &e in mesh.edges_on_cell.row(c) {
                 let [a, b] = mesh.cells_on_edge[e];
                 let other = if a == c { b } else { a };
                 let d = mesh.cell_pos[other] - mesh.cell_pos[c];
@@ -76,7 +77,9 @@ impl Gradients {
                 .map(|&(x, y, w)| (w * (i11 * x + i12 * y), w * (i12 * x + i22 * y)))
                 .collect();
 
-            let cell_arms = mesh.edges_on_cell[c]
+            let cell_arms = mesh
+                .edges_on_cell
+                .row(c)
                 .iter()
                 .map(|&e| {
                     let arm = mesh.edge_pos[e] - mesh.cell_pos[c];
@@ -87,7 +90,6 @@ impl Gradients {
             basis.push((e1, e2));
             weights.push(cell_weights);
             arms.push(cell_arms);
-            let _ = &basis;
         }
 
         Gradients {
@@ -99,47 +101,53 @@ impl Gradients {
 
     /// Gradient of a cell field, in each cell's own tangent-plane basis.
     pub fn compute(&self, mesh: &Mesh, q: &[f64], out: &mut [(f64, f64)]) {
-        for (c, o) in out.iter_mut().enumerate() {
-            let (mut gx, mut gy) = (0.0, 0.0);
-            for (&e, &(wx, wy)) in mesh.edges_on_cell[c].iter().zip(&self.weights[c]) {
-                let [a, b] = mesh.cells_on_edge[e];
-                let other = if a == c { b } else { a };
-                let dq = q[other] - q[c];
-                gx += wx * dq;
-                gy += wy * dq;
+        crate::parallel::chunks(out, |start, part| {
+            for (i, o) in part.iter_mut().enumerate() {
+                let c = start + i;
+                let (mut gx, mut gy) = (0.0, 0.0);
+                for (&e, &(wx, wy)) in mesh.edges_on_cell.row(c).iter().zip(&self.weights[c]) {
+                    let [a, b] = mesh.cells_on_edge[e];
+                    let other = if a == c { b } else { a };
+                    let dq = q[other] - q[c];
+                    gx += wx * dq;
+                    gy += wy * dq;
+                }
+                *o = (gx, gy);
             }
-            *o = (gx, gy);
-        }
+        });
     }
 
     /// Scale each gradient down until no edge reconstruction leaves the range
     /// of the cell's own neighbourhood.
     pub fn limit(&self, mesh: &Mesh, q: &[f64], grad: &mut [(f64, f64)]) {
-        for c in 0..mesh.n_cells() {
-            let mut lo = q[c];
-            let mut hi = q[c];
-            for &e in &mesh.edges_on_cell[c] {
-                let [a, b] = mesh.cells_on_edge[e];
-                let other = if a == c { b } else { a };
-                lo = lo.min(q[other]);
-                hi = hi.max(q[other]);
-            }
+        crate::parallel::chunks(grad, |start, part| {
+            for (i, g) in part.iter_mut().enumerate() {
+                let c = start + i;
+                let mut lo = q[c];
+                let mut hi = q[c];
+                for &e in mesh.edges_on_cell.row(c) {
+                    let [a, b] = mesh.cells_on_edge[e];
+                    let other = if a == c { b } else { a };
+                    lo = lo.min(q[other]);
+                    hi = hi.max(q[other]);
+                }
 
-            let (gx, gy) = grad[c];
-            let mut phi: f64 = 1.0;
-            for &(ax, ay) in &self.arms[c] {
-                let d = gx * ax + gy * ay;
-                let allowed = if d > 0.0 {
-                    hi - q[c]
-                } else if d < 0.0 {
-                    lo - q[c]
-                } else {
-                    continue;
-                };
-                phi = phi.min((allowed / d).clamp(0.0, 1.0));
+                let (gx, gy) = *g;
+                let mut phi: f64 = 1.0;
+                for &(ax, ay) in &self.arms[c] {
+                    let d = gx * ax + gy * ay;
+                    let allowed = if d > 0.0 {
+                        hi - q[c]
+                    } else if d < 0.0 {
+                        lo - q[c]
+                    } else {
+                        continue;
+                    };
+                    phi = phi.min((allowed / d).clamp(0.0, 1.0));
+                }
+                *g = (gx * phi, gy * phi);
             }
-            grad[c] = (gx * phi, gy * phi);
-        }
+        });
     }
 
     /// Value the cell hands to one of its edges, `slot` indexing
@@ -153,14 +161,6 @@ impl Gradients {
     /// an ambient vector.
     pub fn basis(&self, cell: usize) -> (Vec3, Vec3) {
         self.basis[cell]
-    }
-
-    /// Position of `edge` in `Mesh::edges_on_cell[cell]`.
-    pub fn slot_of(mesh: &Mesh, cell: usize, edge: usize) -> usize {
-        mesh.edges_on_cell[cell]
-            .iter()
-            .position(|&e| e == edge)
-            .expect("edge lies on its cell")
     }
 }
 
@@ -260,13 +260,13 @@ mod tests {
         for c in 0..mesh.n_cells() {
             let mut lo = q[c];
             let mut hi = q[c];
-            for &e in &mesh.edges_on_cell[c] {
+            for &e in mesh.edges_on_cell.row(c) {
                 let [a, b] = mesh.cells_on_edge[e];
                 let other = if a == c { b } else { a };
                 lo = lo.min(q[other]);
                 hi = hi.max(q[other]);
             }
-            for slot in 0..mesh.edges_on_cell[c].len() {
+            for slot in 0..mesh.edges_on_cell.row(c).len() {
                 let v = grads.at_edge(c, slot, q[c], g[c]);
                 assert!(
                     v >= lo - 1e-12 && v <= hi + 1e-12,
