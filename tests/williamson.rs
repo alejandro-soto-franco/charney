@@ -1,8 +1,10 @@
 //! End-to-end runs of the standard test cases.
 
 use charney::mesh::Mesh;
-use charney::swe::{Model, State, Work};
-use charney::williamson::{MountainFlow, SteadyZonalFlow};
+use charney::swe::{GRAVITY, Model, OMEGA, State, Work};
+use charney::williamson::{
+    CosineBell, MountainFlow, RossbyHaurwitz, SteadyZonalFlow, angle_step, lonlat, wave_phase,
+};
 use charney::{Sphere, Surface, Wgs84};
 
 struct Outcome {
@@ -22,7 +24,7 @@ fn steady_zonal<S: Surface>(level: u32, days: f64, surface: &S) -> Outcome {
 
     let mut state = exact.clone();
     let mut model = Model::new(mesh, surface, case.g, case.omega);
-    let mut work = Work::new(&model.mesh);
+    let mut work = Work::for_state(&model.mesh, &state);
     let steps = (days * 86_400.0 / model.stable_step(mean_depth, 0.4)).ceil() as usize;
     let dt = days * 86_400.0 / steps as f64;
 
@@ -99,7 +101,7 @@ fn case_five_holds_its_invariants() {
 
     let mut model = Model::new(mesh, &surface, case.g, case.omega);
     model.bottom = bottom;
-    let mut work = Work::new(&model.mesh);
+    let mut work = Work::for_state(&model.mesh, &state);
 
     let days = 5.0;
     let steps = (days * 86_400.0 / model.stable_step(mean_depth, 0.4)).ceil() as usize;
@@ -155,5 +157,87 @@ fn refining_separates_the_spheroid_from_the_sphere() {
     assert!(
         fine > 1.2,
         "spheroid drifts only {fine} times as far at level 4"
+    );
+}
+
+/// Case 1 with the limited upwind flux: the tracer total must not move, and
+/// the reconstruction must not manufacture a negative mixing ratio anywhere.
+/// `examples/williamson1` runs the same case for all three flux forms and
+/// prints what each costs.
+#[test]
+fn case_one_conserves_the_tracer_and_keeps_it_positive() {
+    let surface = Sphere::EARTH;
+    let mesh = Mesh::scvt(3, 60, &surface);
+    let case = CosineBell::standard(surface.radius);
+    let mut state = case.state(&mesh, &surface);
+
+    let cells = mesh.n_cells();
+    let dx = mesh.min_dc();
+    let mut model = Model::new(mesh, &surface, GRAVITY, OMEGA);
+    model.frozen_flow = true;
+    let mut work = Work::for_state(&model.mesh, &state);
+
+    let period = case.period(surface.radius);
+    let steps = (period / (0.4 * dx / case.u0)).ceil() as usize;
+    let before = model.invariants(&state);
+    model.integrate(&mut state, period / steps as f64, steps, &mut work);
+    let after = model.invariants(&state);
+
+    let drift = (after.tracer_mass[0] - before.tracer_mass[0]).abs() / before.tracer_mass[0];
+    assert!(drift < 1e-12, "tracer mass drift {drift}");
+
+    let mut q = vec![0.0; cells];
+    model.mixing_ratio(&state, 0, &mut q);
+    let lowest = q.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(lowest > -1e-9 * case.peak, "mixing ratio went to {lowest}");
+
+    // The flow was frozen, so nothing else may have moved.
+    assert!((after.mass - before.mass).abs() / before.mass < 1e-14);
+}
+
+/// Case 6 must travel at close to the speed the nondivergent theory gives.
+/// Shallow water is divergent, so the solver reads a few per cent low; a
+/// staggering or Coriolis error would put it somewhere else entirely.
+#[test]
+fn case_six_travels_at_close_to_the_predicted_speed() {
+    let surface = Sphere::EARTH;
+    let days = 4usize;
+    let mesh = Mesh::scvt(3, 60, &surface);
+    let case = RossbyHaurwitz::default();
+    let mut state = case.state(&mesh, &surface);
+    let coords: Vec<(f64, f64)> = (0..mesh.n_cells())
+        .map(|c| lonlat(&surface, mesh.cell_pos[c]))
+        .collect();
+
+    let mean_depth = state.h.iter().sum::<f64>() / mesh.n_cells() as f64;
+    let mut model = Model::new(mesh, &surface, case.g, case.omega);
+    let mut work = Work::for_state(&model.mesh, &state);
+    let per_day = (86_400.0 / model.stable_step(mean_depth, 0.4)).ceil() as usize;
+    let dt = 86_400.0 / per_day as f64;
+    model.nu4 = model.nu4_stable(dt, 0.2);
+
+    let area = model.mesh.area_cell.clone();
+    let band = (20f64.to_radians(), 70f64.to_radians());
+    let mut phase = wave_phase(&state.h, &coords, &area, case.wavenumber, band);
+    let mut travelled = 0.0;
+    for _ in 0..days {
+        model.integrate(&mut state, dt, per_day, &mut work);
+        let now = wave_phase(&state.h, &coords, &area, case.wavenumber, band);
+        travelled += angle_step(phase, now);
+        phase = now;
+    }
+
+    let measured = travelled / case.wavenumber / (days as f64 * 86_400.0);
+    let predicted = case.pattern_speed();
+    let short = 1.0 - measured / predicted;
+    assert!(
+        (0.0..0.25).contains(&short),
+        "pattern speed {} deg/day against {} deg/day",
+        measured.to_degrees() * 86_400.0,
+        predicted.to_degrees() * 86_400.0
+    );
+    assert!(
+        state.h.iter().all(|&h| h.is_finite() && h > 0.0),
+        "the run came apart"
     );
 }

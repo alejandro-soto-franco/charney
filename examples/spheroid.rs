@@ -67,7 +67,7 @@ fn drift<S: Surface>(level: u32, surface: &S) -> f64 {
 
     let mut state = initial.clone();
     let mut model = Model::new(mesh, surface, case.g, case.omega);
-    let mut work = Work::new(&model.mesh);
+    let mut work = Work::for_state(&model.mesh, &state);
     let steps = (DAYS * 86_400.0 / model.stable_step(mean_depth, 0.4)).ceil() as usize;
     model.integrate(&mut state, DAYS * 86_400.0 / steps as f64, steps, &mut work);
 

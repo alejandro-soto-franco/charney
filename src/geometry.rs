@@ -37,6 +37,19 @@ pub trait Surface: Send + Sync {
     fn sin_geodetic_latitude(&self, surface: Vec3) -> f64 {
         self.normal(surface).z
     }
+
+    /// Eastward and northward unit vectors in the tangent plane at a surface
+    /// point, for turning a wind given as `(zonal, meridional)` into an
+    /// ambient vector. Degenerate at the poles, where longitude is not
+    /// defined; both come back zero there.
+    fn wind_basis(&self, surface: Vec3) -> (Vec3, Vec3) {
+        let east = Vec3::new(-surface.y, surface.x, 0.0);
+        if east.norm() < 1e-9 * surface.norm() {
+            return (Vec3::ZERO, Vec3::ZERO);
+        }
+        let east = east.normalized();
+        (east, self.normal(surface).cross(east))
+    }
 }
 
 /// A sphere of the given radius.
@@ -180,6 +193,24 @@ mod tests {
             "gap {}",
             geodetic - geocentric
         );
+    }
+
+    #[test]
+    fn the_wind_basis_is_orthonormal_and_points_the_right_way() {
+        for surface in [&Sphere::EARTH as &dyn Surface, &Wgs84::WGS84] {
+            let p = surface.embed(Vec3::new(0.4, 0.3, 0.6));
+            let (east, north) = surface.wind_basis(p);
+            let up = surface.normal(p);
+            assert!((east.norm() - 1.0).abs() < 1e-12);
+            assert!((north.norm() - 1.0).abs() < 1e-12);
+            assert!(east.dot(north).abs() < 1e-12);
+            assert!(east.dot(up).abs() < 1e-12);
+            assert!(north.dot(up).abs() < 1e-12);
+            // East circles the axis, north climbs towards it.
+            assert!(east.z.abs() < 1e-12);
+            assert!(north.z > 0.0);
+            assert!(east.cross(north).dot(up) > 0.0);
+        }
     }
 
     #[test]

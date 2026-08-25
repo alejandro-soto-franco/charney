@@ -4,6 +4,7 @@ pub mod dec;
 pub mod geometry;
 pub mod mesh;
 pub mod swe;
+pub mod transport;
 pub mod trisk;
 pub mod vec3;
 pub mod williamson;

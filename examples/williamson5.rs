@@ -10,11 +10,11 @@ use charney::Sphere;
 use charney::mesh::Mesh;
 use charney::swe::{Model, Work};
 use charney::williamson::{MountainFlow, lonlat};
-use charney::zarr::Store;
+use charney::zarr::{Attribute, Store};
 
 fn main() -> std::io::Result<()> {
     let surface = Sphere::EARTH;
-    let level = 5;
+    let level: u32 = 5;
     let days = 15.0;
     let output_every = 6.0 * 3600.0;
 
@@ -30,7 +30,7 @@ fn main() -> std::io::Result<()> {
 
     let mut model = Model::new(mesh, &surface, case.g, case.omega);
     model.bottom = bottom.clone();
-    let mut work = Work::new(&model.mesh);
+    let mut work = Work::for_state(&model.mesh, &state);
 
     let mean_depth = state.h.iter().sum::<f64>() / cells as f64;
     let per_slice = (output_every / model.stable_step(mean_depth, 0.4)).ceil() as usize;
@@ -39,29 +39,30 @@ fn main() -> std::io::Result<()> {
 
     let store = Store::create(
         "out/williamson5.zarr",
-        r#""title":"Williamson case 5","surface":"sphere","level":5,"integrator":"rk4""#,
+        &[
+            Attribute::text("title", "Williamson case 5, flow over an isolated mountain"),
+            Attribute::text("surface", "sphere"),
+            Attribute::number("level", level as f64),
+            Attribute::text("integrator", "rk4"),
+        ],
     )?;
-    store.coordinate(
-        "lon",
-        "cell",
-        &coords.iter().map(|c| c.0).collect::<Vec<_>>(),
+    let lons: Vec<f64> = coords.iter().map(|c| c.0).collect();
+    let lats: Vec<f64> = coords.iter().map(|c| c.1).collect();
+    let times: Vec<f64> = (0..slices).map(|i| i as f64 * output_every).collect();
+    store.coordinate("lon", "cell", "radians_east", &lons)?;
+    store.coordinate("lat", "cell", "radians_north", &lats)?;
+    store.coordinate("bottom", "cell", "m", &bottom)?;
+    store.coordinate("time", "time", "seconds", &times)?;
+    let mut h_out = store.array("h", cells, slices, "cell", "m", "fluid thickness")?;
+    let mut speed_out = store.array("speed", cells, slices, "cell", "m s-1", "wind speed")?;
+    let mut pv_out = store.array(
+        "potential_vorticity",
+        duals,
+        slices,
+        "dual",
+        "m-1 s-1",
+        "potential vorticity",
     )?;
-    store.coordinate(
-        "lat",
-        "cell",
-        &coords.iter().map(|c| c.1).collect::<Vec<_>>(),
-    )?;
-    store.coordinate("bottom", "cell", &bottom)?;
-    store.coordinate(
-        "time",
-        "time",
-        &(0..slices)
-            .map(|i| i as f64 * output_every)
-            .collect::<Vec<_>>(),
-    )?;
-    let mut h_out = store.array("h", cells, slices, "cell")?;
-    let mut speed_out = store.array("speed", cells, slices, "cell")?;
-    let mut pv_out = store.array("potential_vorticity", duals, slices, "dual")?;
 
     let start = model.invariants(&state);
     let mut speed = vec![0.0; cells];

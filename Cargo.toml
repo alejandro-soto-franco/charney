@@ -4,10 +4,10 @@ version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.85"
 license      = "MIT OR Apache-2.0"
-description  = "Rotating shallow water on the sphere and on an Earth-fitted oblate spheroid, with a discrete exterior calculus operator layer"
+description  = "Rotating shallow water on a sphere and on an Earth-fitted oblate spheroid: a C-grid finite-volume core with tracer transport and Zarr v3 output"
 repository   = "https://github.com/alejandro-soto-franco/charney"
 readme       = "README.md"
-keywords     = ["shallow-water", "geophysical", "climate", "sphere", "dec"]
+keywords     = ["shallow-water", "geophysical", "climate", "sphere", "zarr"]
 categories   = ["science", "simulation", "mathematics"]
 
 [dependencies]

@@ -102,7 +102,7 @@ impl Mesh {
     }
 
     /// Bisected icosahedron at the given level, embedded in the surface.
-    pub fn icosahedral<S: Surface>(level: u32, surface: &S) -> Mesh {
+    pub fn icosahedral<S: Surface + ?Sized>(level: u32, surface: &S) -> Mesh {
         let (unit, tris) = bisected_icosahedron(level);
         Mesh::from_triangulation(&unit, &tris, surface, level)
     }
@@ -117,7 +117,7 @@ impl Mesh {
     /// afterwards, so a sphere and a spheroid share one grid and differ only
     /// in geometry. Sixty sweeps are enough; `trisk` has a test for what
     /// they buy.
-    pub fn scvt<S: Surface>(level: u32, iterations: u32, surface: &S) -> Mesh {
+    pub fn scvt<S: Surface + ?Sized>(level: u32, iterations: u32, surface: &S) -> Mesh {
         let (mut unit, tris) = bisected_icosahedron(level);
         let ball = crate::geometry::Sphere::new(1.0);
         for _ in 0..iterations {
@@ -150,7 +150,7 @@ impl Mesh {
         acc / area
     }
 
-    fn from_triangulation<S: Surface>(
+    fn from_triangulation<S: Surface + ?Sized>(
         unit: &[Vec3],
         tris: &[[usize; 3]],
         surface: &S,
