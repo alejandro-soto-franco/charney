@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use charney::Sphere;
 use charney::mesh::Mesh;
-use charney::swe::{GRAVITY, Model, OMEGA, State, Work};
+use charney::swe::{GRAVITY, Model, OMEGA, Work};
 use charney::williamson::SteadyZonalFlow;
 
 fn main() {
@@ -47,6 +47,5 @@ fn main() {
             cells as f64 / per_step,
             per_step * 86_400.0 / dt,
         );
-        let _ = State::zeros(&model.mesh);
     }
 }
