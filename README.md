@@ -29,10 +29,10 @@ Velocity reaches a cell centre, for output and for a Courant number, through
 the Perot reconstruction [\[7\]](#ref-7).
 
 Two conventions matter. The discrete manifold is the polyhedron inscribed in
-the surface, so lengths are chords, areas are planar, and the three kites of a
-triangle tile it exactly, which is what makes mass conservation exact. And the
+the surface. Lengths are chords, areas are planar, and the three kites of a
+triangle tile it exactly. Mass conservation is therefore exact. The
 Coriolis parameter is `2 omega n_z`, the axial component of the true surface
-normal, so on WGS 84 it follows the geodetic latitude rather than the
+normal. On WGS 84 it follows the geodetic latitude, not the
 geocentric one.
 
 ## Results
@@ -47,9 +47,9 @@ five days
 | 4 | 2562 | 412 | 5.919e-4 | 1.569e-3 | 1.93 | 3.0e-15 | -1.7e-9 |
 | 5 | 10242 | 200 | 1.675e-4 | 6.277e-4 | 1.82 | 1.8e-14 | -4.5e-10 |
 
-Case 1, a cosine bell carried once around the sphere under a frozen wind, at
+Case 1, a cosine bell moved once around the sphere under a frozen wind, at
 level 5 (`cargo run --release --example williamson1`). The three flux forms and
-what each costs:
+their errors:
 
 | flux | l2(q) | order | min | max |
 |---|---|---|---|---|
@@ -67,13 +67,13 @@ total energy drifts by 1e-9 and potential enstrophy by 5e-4.
 Case 6, the Rossby-Haurwitz wave of zonal wavenumber four, fourteen days at
 level 5 (`cargo run --release --example williamson6`): the pattern travels east
 at 11.15 degrees a day against the 12.20 the nondivergent theory gives, 8.5 per
-cent low, which is the divergence the shallow-water system has and the theory
+cent low. The shallow-water system has a divergence that the theory
 does not. Mass is conserved to 7e-15, energy drifts by 1.8e-4 and potential
 enstrophy by 4.1e-3.
 
 Sphere against spheroid (`cargo run --release --example spheroid`): case 2 is an
-exact steady solution on a sphere and not on WGS 84, so the spheroid run
-adjusts. Reading one resolution settles nothing, since on a coarse mesh the
+exact steady solution on a sphere and not on WGS 84. The spheroid run
+therefore adjusts. Reading one resolution settles nothing, since on a coarse mesh the
 sphere's own drift is numerical error of the same size. Refining separates them,
 because only one of the two converges away. Root-mean-square height change after
 three days, in metres, on a grid and a solver shared by both, with the sphere
@@ -87,7 +87,7 @@ given the spheroid's authalic radius:
 
 ## Tracer transport
 
-Tracers are stored as column mass `h q`, so their transport is a flux
+Tracers are stored as column mass `h q`. Their transport is a flux
 divergence like the thickness equation and every tracer total is conserved to
 rounding. The mixing ratio reaches an edge one of three ways: a centred average,
 which has no dissipation at all and rings; the upwind cell's value extrapolated
@@ -102,8 +102,8 @@ is exact only on a uniform mesh. Sixty sweeps of Lloyd relaxation
 [\[5\]](#ref-5), [\[6\]](#ref-6) on the unit sphere take the reconstruction
 from half-order convergence to second order and cut its error at level 4 by a
 factor of seventeen. Relaxation runs on the unit sphere and the result is
-embedded afterwards, so a sphere and a spheroid share one grid. Moving a cell
-centre changes no incidence, so the topology is built once and a sweep touches
+embedded afterwards. A sphere and a spheroid share one grid. Moving a cell
+centre changes no incidence. The topology is built once and a sweep touches
 positions alone: sixty sweeps at level 6 take a quarter of a second.
 
 ```rust
@@ -120,9 +120,9 @@ twelve pentagons. Setting the coefficient from a damping time alone is unsafe:
 explicit RK4 is stable only out to about `2.78 / lambda`, and on a coarse mesh
 the gravity-wave time step is long enough to cross that. `Model::nu4_stable`
 measures the spectral radius by power iteration and returns a fraction of what
-the step allows; `Model::damping_time` reports what that buys at the grid scale.
+the step allows; `Model::damping_time` reports the damping time at the grid scale.
 Between a fifth and a half of the limit changes the case-6 pattern speed by one
-part in a hundred, which is the operator being properly scale-selective.
+part in a hundred, as expected of a scale-selective operator.
 
 ## Output
 
@@ -166,22 +166,22 @@ feature is on:
 | 7 | 163842 | 1.20 | 48.85 | 27.38 | 18.17 |
 
 The step is four RK4 stages, each a handful of passes over the edges, the cells
-and the duals. Every pass gathers through an index, so the loops are bound by
-memory rather than by arithmetic: the parallel speedup saturates near 1.8 at
+and the duals. Every pass gathers through an index. Memory bandwidth limits the
+loops: the parallel speedup saturates near 1.8 at
 eight threads and then falls back. That ceiling, not the pool, is also why the
 last two columns are close on a coarse mesh, where a slice shorter than sixteen
 thousand entries stays on the calling thread.
 
 What bought the serial time was layout. The incidence arrays are packed rows in
-one block rather than a `Vec` per cell; the orientation signs are folded into
-the lengths they multiply, so an operator reads one contiguous stream where it
+one block, with no `Vec` per cell; the orientation signs are folded into
+the lengths they multiply. An operator reads one contiguous stream where it
 used to gather a length and a sign; the average onto the duals gathers where it
 used to scatter; and the potential vorticity sits beside the mass flux in one
 array, since the Coriolis loop gathers both for all ten stencil neighbours of
 every edge and one stream halves the cache lines it touches.
 
 `examples/checksum` prints a digest of a run, and the serial and parallel builds
-print the same digits, so chunking changes no answer.
+print the same digits. Chunking changes no answer.
 
 ```console
 $ cargo run --release --example bench
@@ -205,11 +205,11 @@ runs.
 
 ## Scope
 
-One layer, no physics, no parallelism. The scheme conserves mass and tracer mass
+The model has one layer, with no physics and no parallelism. The scheme conserves mass and tracer mass
 exactly and energy nearly, and potential enstrophy only approximately. Grid
 imprinting at the twelve pentagons shows in the momentum residual and grows as
-the mesh refines, which is the known behaviour of this scheme on an icosahedral
-grid and is what the biharmonic term is there for.
+the mesh refines. This is the known behaviour of the scheme on an icosahedral
+grid, and the biharmonic term exists to control it.
 
 ## References
 
